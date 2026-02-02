@@ -1,0 +1,464 @@
+# **Complete Mobile Lock Solution for Xfce on Mobian**
+
+A step-by-step guide to implement smartphone-like lock behavior on Xfce with Mobian, disabling mouse buttons while keeping touchscreen functional.
+
+## **1. System Requirements & Installation**
+
+### **Prerequisites:**
+- Debian Trixie/Mobian on ARM64 (PinePhone, PineTab, etc.)
+- Xfce desktop environment
+- Working Bluetooth mouse
+
+### **Install Required Packages:**
+```bash
+# Update system
+sudo apt update
+sudo apt upgrade
+
+# Install essential packages
+sudo apt install xfce4-power-manager light-locker xss-lock
+sudo apt install acpid upower xbacklight
+sudo apt install xclip xsel notify-send  # For notifications and clipboard
+sudo apt install evtest  # For kernel-level input blocking (optional)
+
+# Bluetooth tools (if using Bluetooth mouse)
+sudo apt install bluez bluetooth bluetoothctl
+```
+
+## **2. Identify Your Input Devices**
+
+First, discover your device IDs:
+```bash
+xinput list
+```
+
+You should see something like:
+```
+⎡ Virtual core pointer
+⎜   ↳ i4 Mouse                 id=12   [slave pointer]
+⎜   ↳ Synaptics S3706B         id=7    [slave pointer]  # TOUCHSCREEN
+⎜   ↳ i4 Keyboard              id=10   [slave pointer]  # Keyboard trackpoint
+⎣ Virtual core keyboard
+    ↳ i4 Keyboard              id=11   [slave keyboard] # Keyboard keys
+```
+
+**Note your device IDs:**
+- **Mouse**: Device 12 (i4 Mouse) - THIS GETS DISABLED
+- **Touchscreen**: Device 7 (Synaptics) - DO NOT DISABLE
+- **Keyboard pointer**: Device 10 - Optional to disable
+- **Keyboard keys**: Device 11 - DO NOT DISABLE
+
+## **3. Create the Mouse Blocking Script**
+
+```bash
+mkdir -p ~/.local/bin
+cat > ~/.local/bin/block-mouse-only << 'EOF'
+#!/bin/bash
+# Blocks only the mouse (Device 12), leaves touchscreen functional
+
+case "$1" in
+    start)
+        echo "Blocking mouse (Device 12)..."
+        
+        # Save current state
+        if xinput list-props 12 2>/dev/null | grep -q "Device Enabled (.*):.*1"; then
+            echo "12:enabled" > /tmp/mouse_state.save
+        else
+            echo "12:disabled" > /tmp/mouse_state.save
+        fi
+        
+        # Save button mapping
+        xinput get-button-map 12 2>/dev/null > /tmp/mouse_buttons.save
+        
+        # Disable device and set buttons to 0
+        xinput disable 12 2>/dev/null
+        xinput set-button-map 12 0 0 0 0 0 0 0 2>/dev/null
+        sleep 0.1
+        
+        echo "Mouse blocked."
+        ;;
+        
+    stop)
+        echo "Restoring mouse (Device 12)..."
+        
+        # Restore from saved state
+        if [ -f /tmp/mouse_state.save ]; then
+            while IFS=: read -r dev_id state; do
+                if [ "$state" = "enabled" ]; then
+                    xinput enable "$dev_id" 2>/dev/null
+                fi
+            done < /tmp/mouse_state.save
+            rm -f /tmp/mouse_state.save
+        else
+            xinput enable 12 2>/dev/null
+        fi
+        
+        # Restore button mapping
+        if [ -f /tmp/mouse_buttons.save ]; then
+            buttons=$(cat /tmp/mouse_buttons.save)
+            xinput set-button-map 12 $buttons 2>/dev/null
+            rm -f /tmp/mouse_buttons.save
+        else
+            xinput set-button-map 12 1 2 3 4 5 6 7 2>/dev/null
+        fi
+        
+        echo "Mouse restored."
+        ;;
+        
+    test)
+        echo "Testing mouse blocking for 5 seconds..."
+        $0 start
+        sleep 5
+        $0 stop
+        echo "Test complete."
+        ;;
+        
+    status)
+        echo "Mouse (Device 12) status:"
+        if xinput list-props 12 2>/dev/null | grep -q "Device Enabled (.*):.*1"; then
+            echo "  Enabled: YES"
+        else
+            echo "  Enabled: NO"
+        fi
+        echo "  Buttons: $(xinput get-button-map 12 2>/dev/null | head -1)"
+        ;;
+esac
+EOF
+
+chmod +x ~/.local/bin/block-mouse-only
+```
+
+## **4. Create the Main Mobile Lock Script**
+
+```bash
+cat > ~/.local/bin/mobile-lock << 'EOF'
+#!/bin/bash
+# Main lock script - turns off screen, disables mouse, keeps touchscreen
+
+LOCKFILE="/tmp/mobile-lock.lock"
+BACKLIGHT_PATH="/sys/class/backlight/ae94000.dsi.0"  # Adjust for your device
+BRIGHTNESS_SAVE="/tmp/backlight_save"
+
+case "$1" in
+    lock)
+        echo "=== LOCKING ==="
+        echo "$$" > "$LOCKFILE"
+        
+        # Save current brightness
+        if [ -f "$BACKLIGHT_PATH/brightness" ]; then
+            cat "$BACKLIGHT_PATH/brightness" > "$BRIGHTNESS_SAVE" 2>/dev/null
+        fi
+        
+        # Block mouse FIRST (before screen off)
+        ~/.local/bin/block-mouse-only start
+        sleep 0.2
+        
+        # Turn off screen
+        xset dpms force off
+        
+        # Set backlight to minimum
+        if [ -f "$BACKLIGHT_PATH/brightness" ]; then
+            echo 1 | sudo tee "$BACKLIGHT_PATH/brightness" >/dev/null 2>&1
+        fi
+        
+        # Lock screen (optional)
+        if command -v light-locker-command >/dev/null; then
+            light-locker-command -l &
+        fi
+        
+        # CPU power saving
+        if [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
+            echo powersave | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1
+        fi
+        
+        notify-send "📴 Locked" "Mouse disabled" -t 1500
+        echo "=== LOCKED ==="
+        ;;
+        
+    unlock)
+        echo "=== UNLOCKING ==="
+        rm -f "$LOCKFILE"
+        
+        # Restore backlight
+        if [ -f "$BACKLIGHT_PATH/brightness" ]; then
+            if [ -f "$BRIGHTNESS_SAVE" ]; then
+                SAVED=$(cat "$BRIGHTNESS_SAVE" 2>/dev/null)
+                if [ -n "$SAVED" ] && [ "$SAVED" -gt 0 ]; then
+                    echo "$SAVED" | sudo tee "$BACKLIGHT_PATH/brightness" >/dev/null 2>&1
+                fi
+                rm -f "$BRIGHTNESS_SAVE"
+            else
+                if [ -f "$BACKLIGHT_PATH/max_brightness" ]; then
+                    MAX=$(cat "$BACKLIGHT_PATH/max_brightness" 2>/dev/null)
+                    HALF=$((MAX / 2))
+                    echo "$HALF" | sudo tee "$BACKLIGHT_PATH/brightness" >/dev/null 2>&1
+                fi
+            fi
+            sleep 0.1
+        fi
+        
+        # Turn screen on
+        xset dpms force on
+        sleep 0.1
+        
+        # Reset DPMS
+        xset s off
+        xset -dpms
+        
+        # Restore mouse
+        ~/.local/bin/block-mouse-only stop
+        
+        # Restore CPU governor
+        if [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
+            echo schedutil | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1
+        fi
+        
+        notify-send "📱 Unlocked" -t 1500
+        echo "=== UNLOCKED ==="
+        ;;
+        
+    test)
+        echo "Testing lock/unlock cycle (10 seconds)..."
+        $0 lock
+        sleep 10
+        $0 unlock
+        echo "Test complete."
+        ;;
+        
+    status)
+        if [ -f "$LOCKFILE" ]; then
+            echo "Status: LOCKED"
+        else
+            echo "Status: UNLOCKED"
+        fi
+        ~/.local/bin/block-mouse-only status
+        ;;
+        
+    emergency)
+        echo "=== EMERGENCY RESTORE ==="
+        ~/.local/bin/block-mouse-only stop 2>/dev/null
+        xset dpms force on
+        rm -f "$LOCKFILE" "$BRIGHTNESS_SAVE"
+        echo "=== RESTORED ==="
+        ;;
+        
+    *)
+        echo "Mobile Lock Script for Xfce on Mobian"
+        echo "Usage: $0 {lock|unlock|test|status|emergency}"
+        echo ""
+        echo "  lock       - Lock device (disable mouse, screen off)"
+        echo "  unlock     - Unlock device"
+        echo "  test       - Test lock/unlock cycle"
+        echo "  status     - Check current state"
+        echo "  emergency  - Force restore everything"
+        exit 1
+        ;;
+esac
+EOF
+
+chmod +x ~/.local/bin/mobile-lock
+```
+
+## **5. Configure Power Button Behavior**
+
+```bash
+# Create ACPI power button handler
+sudo tee /etc/acpi/powerbtn-mobile.sh << 'EOF'
+#!/bin/bash
+# Power button handler
+
+USER="mobian"
+LOCKFILE="/tmp/mobile-lock.lock"
+
+# Export display for X11 commands
+export DISPLAY=:0
+
+if [ -f "$LOCKFILE" ]; then
+    # Device is locked - unlock it
+    sudo -u "$USER" /home/mobian/.local/bin/mobile-lock unlock
+else
+    # Device is unlocked - lock it
+    sudo -u "$USER" /home/mobian/.local/bin/mobile-lock lock
+fi
+EOF
+
+sudo chmod +x /etc/acpi/powerbtn-mobile.sh
+
+# Create ACPI event definition
+sudo tee /etc/acpi/events/powerbtn-mobile << 'EOF'
+event=button/power.*
+action=/etc/acpi/powerbtn-mobile.sh
+EOF
+
+# Restart ACPI service
+sudo systemctl restart acpid
+```
+
+## **6. Configure Xfce Power Manager**
+
+```bash
+# Configure Xfce power manager to not interfere
+xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/power-button-action -s 0
+xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/sleep-button-action -s 0
+xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/inactivity-on-battery -s 0
+xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/inactivity-on-ac -s 0
+
+# Restart power manager
+pkill xfce4-power-manager
+xfce4-power-manager --daemon &
+```
+
+## **7. Test the Setup**
+
+### **Test 1: Basic functionality**
+```bash
+# Test mouse blocking
+~/.local/bin/block-mouse-only test
+
+# Test lock/unlock
+~/.local/bin/mobile-lock test
+```
+
+### **Test 2: Manual testing**
+```bash
+# Lock manually
+~/.local/bin/mobile-lock lock
+# Try: 
+# - Mouse clicks (should NOT work)
+# - Touchscreen (should work if screen on)
+# - Power button (should unlock)
+# Wait 10 seconds
+~/.local/bin/mobile-lock unlock
+```
+
+### **Test 3: Power button**
+```bash
+# Simulate power button press
+sudo /etc/acpi/powerbtn-mobile.sh
+```
+
+## **8. (Optional) Bluetooth Mouse Enhancement**
+
+If using Bluetooth mouse and it still wakes the device:
+
+```bash
+cat > ~/.local/bin/bluetooth-mouse-sleep << 'EOF'
+#!/bin/bash
+# Additional Bluetooth control for mouse
+
+case "$1" in
+    sleep)
+        MAC=$(bluetoothctl devices | grep -i "mouse" | awk '{print $2}' | head -1)
+        if [ -n "$MAC" ]; then
+            bluetoothctl disconnect "$MAC" 2>/dev/null
+            echo "Bluetooth mouse disconnected"
+        fi
+        ;;
+    wake)
+        MAC=$(bluetoothctl devices | grep -i "mouse" | awk '{print $2}' | head -1)
+        if [ -n "$MAC" ]; then
+            bluetoothctl connect "$MAC" 2>/dev/null
+            echo "Bluetooth mouse reconnecting..."
+        fi
+        ;;
+esac
+EOF
+
+chmod +x ~/.local/bin/bluetooth-mouse-sleep
+```
+
+## **9. Create Desktop Shortcut (Optional)**
+
+```bash
+cat > ~/Desktop/Mobile\ Lock.desktop << 'EOF'
+[Desktop Entry]
+Type=Application
+Name=Mobile Lock Toggle
+Exec=/home/mobian/.local/bin/mobile-lock toggle
+Icon=phone-locked
+EOF
+
+chmod +x ~/Desktop/Mobile\ Lock.desktop
+```
+
+## **10. Troubleshooting**
+
+### **If mouse still works after locking:**
+```bash
+# Check device ID
+xinput list
+
+# Test directly on Device 12
+xinput disable 12
+xinput set-button-map 12 0 0 0 4 5 6 7
+# Try clicking
+sleep 5
+xinput enable 12
+xinput set-button-map 12 1 2 3 4 5 6 7
+```
+
+### **If screen doesn't turn off:**
+```bash
+# Check DPMS
+xset q | grep -i dpms
+
+# Test manually
+xset dpms force off
+sleep 2
+xset dpms force on
+```
+
+### **If power button doesn't work:**
+```bash
+# Check ACPI events
+sudo acpi_listen
+# Press power button to see events
+
+# Test ACPI script manually
+sudo /etc/acpi/powerbtn-mobile.sh
+
+# Check permissions
+ls -la /etc/acpi/powerbtn-mobile.sh
+```
+
+## **11. Customization**
+
+### **Adjust device IDs:**
+Edit `~/.local/bin/block-mouse-only`:
+- Change `12` to your actual mouse device ID
+- Add other devices to block if needed
+
+### **Adjust backlight path:**
+Edit `~/.local/bin/mobile-lock`:
+```bash
+BACKLIGHT_PATH="/sys/class/backlight/ae94000.dsi.0"
+```
+Find your path: `ls /sys/class/backlight/`
+
+### **Add keyboard trackpoint blocking:**
+In `block-mouse-only` script, add Device 10 handling:
+```bash
+# For keyboard trackpoint
+xinput disable 10 2>/dev/null
+xinput set-button-map 10 0 0 0 4 5 6 7 2>/dev/null
+```
+
+## **12. Final Notes**
+
+- **Touchscreen remains functional** when locked (for emergency use)
+- **Mouse buttons are disabled** but pointer movement still works
+- **Power button toggles** lock state
+- **System stays awake** with network connectivity
+- **Low power consumption** similar to smartphone lock
+
+To make permanent, add to startup:
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+```
+
+**Emergency restore command:**
+```bash
+~/.local/bin/mobile-lock emergency
+```
+
+This solution provides smartphone-like lock behavior while maintaining Xfce's low memory footprint (~350MB vs Plasma's 1GB+).
